@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FERC EQR Analyzer</title>
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "apache-arrow": "https://cdn.jsdelivr.net/npm/apache-arrow@14/Arrow.dom.mjs",
+    "tslib": "https://cdn.jsdelivr.net/npm/tslib@2/tslib.es6.mjs"
+  }
+}
+</script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f4f8;color:#1a202c}
+.header{background:#1a202c;color:#fff;padding:18px 28px}
+.header h1{font-size:1.4em;margin-bottom:4px}
+.header p{color:#a0aec0;font-size:.85em}
+.container{max-width:1400px;margin:0 auto;padding:20px 28px}
+.card{background:#fff;border-radius:8px;padding:20px;margin-bottom:18px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px;margin-bottom:14px}
+label{display:block;font-size:.75em;font-weight:700;color:#4a5568;margin-bottom:4px;text-transform:uppercase;letter-spacing:.05em}
+select{width:100%;padding:7px 9px;border:1px solid #e2e8f0;border-radius:5px;font-size:.88em;background:#fff}
+.radio-group{display:flex;gap:10px;padding-top:2px}
+.radio-group label{display:flex;align-items:center;gap:5px;text-transform:none;font-weight:400;color:#2d3748;cursor:pointer}
+.btn{border:none;padding:9px 22px;border-radius:5px;font-size:.9em;font-weight:700;cursor:pointer;transition:background .15s}
+.btn-primary{background:#3182ce;color:#fff}
+.btn-primary:hover{background:#2b6cb0}
+.btn-primary:disabled{background:#a0aec0;cursor:not-allowed}
+.btn-green{background:#38a169;color:#fff;padding:6px 13px;font-size:.78em}
+.btn-green:hover{background:#276749}
+.btn-green:disabled{background:#a0aec0;cursor:not-allowed}
+.status{background:#edf2f7;border-radius:5px;padding:10px 14px;font-size:.82em;font-family:monospace;white-space:pre-wrap;min-height:36px;margin-top:12px}
+.status.err{background:#fff5f5;color:#c53030;border:1px solid #fed7d7}
+.status.loading{background:#ebf8ff;color:#2c5282}
+.section-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.section-title{font-size:.95em;font-weight:700;color:#2d3748}
+.table-wrap{overflow:auto;max-height:380px}
+table{width:100%;border-collapse:collapse;font-size:.78em}
+th{background:#f7fafc;text-align:left;padding:7px 9px;font-weight:700;color:#4a5568;border-bottom:2px solid #e2e8f0;position:sticky;top:0;white-space:nowrap}
+td{padding:6px 9px;border-bottom:1px solid #edf2f7;color:#2d3748;white-space:nowrap}
+tr:hover td{background:#f7fafc}
+.note{font-size:.78em;color:#718096;font-weight:400}
+#chart-box{min-height:420px}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>FERC EQR Analyzer</h1>
+  <p>Reads PUDL FERC EQR Parquet data from S3 &mdash; no file downloads needed. Powered by DuckDB-WASM.</p>
+</div>
+<div class="container">
+  <div class="card">
+    <div class="grid">
+      <div><label>Start Year</label><select id="sy"></select></div>
+      <div><label>Start Quarter</label>
+        <select id="sq">
+          <option value="1">Q1</option><option value="2">Q2</option>
+          <option value="3">Q3</option><option value="4">Q4</option>
+        </select>
+      </div>
+      <div><label>End Year</label><select id="ey"></select></div>
+      <div><label>End Quarter</label>
+        <select id="eq">
+          <option value="1">Q1</option><option value="2">Q2</option>
+          <option value="3">Q3</option><option value="4" selected>Q4</option>
+        </select>
+      </div>
+      <div><label>ISO / BA</label><select id="iso"></select></div>
+      <div><label>Metric</label>
+        <select id="metric">
+          <option value="wind_ppa">Wind PPA</option>
+          <option value="solar_ppa">Solar PPA</option>
+          <option value="capacity_prices">Capacity Prices</option>
+          <option value="ancillary_service_payments">Ancillary Services</option>
+          <option value="energy_payments">Energy Payments</option>
+        </select>
+      </div>
+      <div><label>Time Grain</label>
+        <div class="radio-group">
+          <label><input type="radio" name="grain" value="quarter" checked> Quarter</label>
+          <label><input type="radio" name="grain" value="year"> Year</label>
+        </div>
+      </div>
+      <div><label>Statistic</label>
+        <select id="stat">
+          <option value="average">Average</option>
+          <option value="median" selected>Median</option>
+          <option value="total_payments">Total Payments</option>
+        </select>
+      </div>
+    </div>
+    <button class="btn btn-primary" id="run-btn" onclick="runQuery()" disabled>Initializing…</button>
+    <div class="status loading" id="status">Loading DuckDB-WASM (first load ~10s)…</div>
+  </div>
+
+  <div class="card" id="chart-card" style="display:none">
+    <div class="section-head">
+      <span class="section-title" id="chart-title">Chart</span>
+    </div>
+    <div id="chart-box"></div>
+  </div>
+
+  <div class="card" id="agg-card" style="display:none">
+    <div class="section-head">
+      <span class="section-title">Aggregated Data</span>
+      <button class="btn btn-green" onclick="dlCsv('agg')">Download CSV</button>
+    </div>
+    <div class="table-wrap" id="agg-table"></div>
+  </div>
+
+  <div class="card" id="det-card" style="display:none">
+    <div class="section-head">
+      <span class="section-title">Detail Records <span class="note" id="det-note"></span></span>
+      <button class="btn btn-green" onclick="dlCsv('det')">Download CSV</button>
+    </div>
+    <div class="table-wrap" id="det-table"></div>
+  </div>
+</div>
+
+<script type="module">
+import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-browser.mjs';
+
+const BASE = 'https://s3.us-west-2.amazonaws.com/pudl.catalyst.coop/ferceqr';
+
+const ISOS = ["ALL","SPP","ERCOT","MISO","PJM","CAISO","NYISO","ISONE","WECC",
+  "BPA","WAPA","DOPD","BASN","AVA","CHGPD","CLMP","GCPD","IPCO","LDWP","NEVP",
+  "NWMT","PACW","PACE","PGE","PSCO","PSEI","PNM","SRP","TEPC","TIDC","WALC",
+  "BANC","IID","SCE","SDGE","SMUD","AEC","FPC","FPL","GVL","JEA","SEC","SOCO",
+  "TAL","TEC","TVA","AEP","GRDA","LES","NPPD","OPPD","SPS","WACM","ALTW","AMRN",
+  "CIN","CONS","DPC","DUK","LGEE","MEC","OTP","WEC","WPS","CPLE","CPLW","DPL",
+  "DUQ","JCPL","METED","NEGA","PEPCO","PENELEC","PPL","PSEG","RGE","OTHER"];
+
+const ISO_CASE = `CASE
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])(spp|swpp|southwest power pool)(?:$|[^a-z])') THEN 'SPP'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])ercot(?:$|[^a-z])') THEN 'ERCOT'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])(miso|midcontinent)(?:$|[^a-z])') THEN 'MISO'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])pjm(?:$|[^a-z])') THEN 'PJM'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])(caiso|california independent system operator)(?:$|[^a-z])') THEN 'CAISO'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])nyiso(?:$|[^a-z])') THEN 'NYISO'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:iso[- ]?new england|isone|nepool)') THEN 'ISONE'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])wecc(?:$|[^a-z])') THEN 'WECC'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])bpa(?:$|[^a-z])|bonneville') THEN 'BPA'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])wapa(?:$|[^a-z])|western area power') THEN 'WAPA'
+  WHEN regexp_matches(lower(coalesce(ba,'')), 'deseret') THEN 'DOPD'
+  WHEN regexp_matches(lower(coalesce(ba,'')), 'basin electric') THEN 'BASN'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])av?a(?:$|[^a-z])|avista') THEN 'AVA'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])chgpd(?:$|[^a-z])|chelan') THEN 'CHGPD'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])clmp(?:$|[^a-z])|clallam') THEN 'CLMP'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])dopc(?:$|[^a-z])|douglas') THEN 'DOPD'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])gcpd(?:$|[^a-z])|grant county') THEN 'GCPD'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])ipco?(?:$|[^a-z])|idaho power') THEN 'IPCO'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])ldwp(?:$|[^a-z])|los angeles department of water|ladwp') THEN 'LDWP'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])nevp(?:$|[^a-z])|nevada power') THEN 'NEVP'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])nwmt(?:$|[^a-z])|northwestern energy') THEN 'NWMT'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])pacw(?:$|[^a-z])|pacificorp west') THEN 'PACW'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])pace(?:$|[^a-z])|pacificorp east') THEN 'PACE'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])pge(?:$|[^a-z])|portland general') THEN 'PGE'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])psco(?:$|[^a-z])|public service company of colorado|xcel colorado') THEN 'PSCO'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])pse[i]?(?:$|[^a-z])|puget sound energy') THEN 'PSEI'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])pnm(?:$|[^a-z])|public service company of new mexico') THEN 'PNM'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])salt river|srp(?:$|[^a-z])') THEN 'SRP'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])tepc(?:$|[^a-z])|tepco|tucson electric') THEN 'TEPC'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])tid(?:$|[^a-z])|turlock') THEN 'TIDC'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])walc(?:$|[^a-z])|western area.*lower colorado') THEN 'WALC'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])banc(?:$|[^a-z])|balancing authority of northern california') THEN 'BANC'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])iid(?:$|[^a-z])|imperial irrigation district') THEN 'IID'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])sce(?:$|[^a-z])|southern california edison') THEN 'SCE'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])sdge(?:$|[^a-z])|san diego gas') THEN 'SDGE'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])smud(?:$|[^a-z])|sacramento municipal utility') THEN 'SMUD'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])aec(?:$|[^a-z])|powersouth') THEN 'AEC'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])fpc(?:$|[^a-z])|florida power corporation|duke energy florida') THEN 'FPC'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])fpl(?:$|[^a-z])|florida power & light|florida power and light') THEN 'FPL'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])gvl(?:$|[^a-z])|gainesville') THEN 'GVL'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])jea(?:$|[^a-z])|jacksonville electric') THEN 'JEA'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])sec(?:$|[^a-z])|seminole electric') THEN 'SEC'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])soa(?:$|[^a-z])|southern company') THEN 'SOCO'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])tal(?:$|[^a-z])|city of tallahassee') THEN 'TAL'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])tec(?:$|[^a-z])|tampa electric') THEN 'TEC'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])tv?a(?:$|[^a-z])|tennessee valley authority') THEN 'TVA'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])aepw?(?:$|[^a-z])|american electric power') THEN 'AEP'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])grda(?:$|[^a-z])|grand river dam') THEN 'GRDA'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])les(?:$|[^a-z])|lincoln electric system') THEN 'LES'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])nppd(?:$|[^a-z])|nebraska public power') THEN 'NPPD'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])oppd(?:$|[^a-z])|omaha public power') THEN 'OPPD'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])spp?l(?:$|[^a-z])|southwestern public service|xcel sps') THEN 'SPS'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])wacm(?:$|[^a-z])|western area.*colorado.*missouri') THEN 'WACM'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])altw(?:$|[^a-z])|ameren illinois') THEN 'ALTW'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])amrn(?:$|[^a-z])|ameren') THEN 'AMRN'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])cin(?:$|[^a-z])|cinergy') THEN 'CIN'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])cons(?:$|[^a-z])|consumers energy') THEN 'CONS'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])dpc(?:$|[^a-z])|dairyland') THEN 'DPC'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])duke(?:$|[^a-z])') THEN 'DUK'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])lgn(?:$|[^a-z])|lg&e|louisville gas') THEN 'LGEE'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])mec(?:$|[^a-z])|midamerican') THEN 'MEC'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])otp(?:$|[^a-z])|otter tail') THEN 'OTP'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])wic(?:$|[^a-z])|wisconsin electric') THEN 'WEC'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])wps(?:$|[^a-z])|wisconsin public service') THEN 'WPS'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])cple(?:$|[^a-z])|carolina power & light|carolina power and light') THEN 'CPLE'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])cplw(?:$|[^a-z])') THEN 'CPLW'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])dpl(?:$|[^a-z])|delmarva') THEN 'DPL'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])duq(?:$|[^a-z])|duquesne') THEN 'DUQ'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])jcpl(?:$|[^a-z])|jersey central') THEN 'JCPL'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])meted(?:$|[^a-z])|met-ed') THEN 'METED'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])nega(?:$|[^a-z])|new england power') THEN 'NEGA'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])pepco(?:$|[^a-z])') THEN 'PEPCO'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])penelec(?:$|[^a-z])') THEN 'PENELEC'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])ppl(?:$|[^a-z])') THEN 'PPL'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])pseg(?:$|[^a-z])') THEN 'PSEG'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])rg&e(?:$|[^a-z])|rochester gas') THEN 'RGE'
+  WHEN regexp_matches(lower(coalesce(ba,'')), '(?:^|[^a-z])yiso(?:$|[^a-z])') THEN 'NYISO'
+  ELSE 'OTHER'
+END`;
+
+// ── state ──────────────────────────────────────────────
+let conn = null;
+let aggData = null, detData = null;
+
+// ── UI init ────────────────────────────────────────────
+(function initUI() {
+  const sy = document.getElementById('sy'), ey = document.getElementById('ey');
+  for (let y = 2013; y <= 2026; y++) {
+    sy.add(new Option(y, y, y===2020, y===2020));
+    ey.add(new Option(y, y, y===2025, y===2025));
+  }
+  document.getElementById('sq').value = '1';
+  document.getElementById('eq').value = '4';
+  const iso = document.getElementById('iso');
+  ISOS.forEach(v => iso.add(new Option(v, v, v==='SPP', v==='SPP')));
+})();
+
+// ── helpers ────────────────────────────────────────────
+function setStatus(msg, cls='') {
+  const el = document.getElementById('status');
+  el.textContent = msg; el.className = 'status ' + cls;
+}
+
+function quarterList(sy, sq, ey, eq) {
+  const out = []; let y=sy, q=sq;
+  while (y < ey || (y===ey && q<=eq)) {
+    out.push(`${y}q${q}`); q++;
+    if (q===5) { y++; q=1; }
+  }
+  return out;
+}
+
+function sqlArr(urls) {
+  return '[' + urls.map(u => `'${u}'`).join(',') + ']';
+}
+
+function arrowToRows(table) {
+  const fields = table.schema.fields.map(f => f.name);
+  const rows = [];
+  for (const batch of table.batches) {
+    const cols = fields.map((_, i) => batch.getChildAt(i));
+    for (let r = 0; r < batch.numRows; r++) {
+      const row = {};
+      fields.forEach((name, i) => {
+        let v = cols[i].get(r);
+        if (typeof v === 'bigint') v = Number(v);
+        row[name] = v;
+      });
+      rows.push(row);
+    }
+  }
+  return rows;
+}
+
+function fmtVal(v) {
+  if (v === null || v === undefined) return '';
+  if (v instanceof Date) return v.toISOString().slice(0, 10);
+  if (typeof v === 'number') return Number.isInteger(v) ? v.toLocaleString() : v.toFixed(4);
+  return String(v);
+}
+
+function renderTable(id, rows) {
+  const el = document.getElementById(id);
+  if (!rows || !rows.length) { el.innerHTML = '<p style="color:#718096;padding:8px">No data</p>'; return; }
+  const cols = Object.keys(rows[0]);
+  const display = rows.slice(0, 1000);
+  let h = '<table><thead><tr>' + cols.map(c => `<th>${c}</th>`).join('') + '</tr></thead><tbody>';
+  display.forEach(row => {
+    h += '<tr>' + cols.map(c => `<td>${fmtVal(row[c])}</td>`).join('') + '</tr>';
+  });
+  h += '</tbody></table>';
+  el.innerHTML = h;
+}
+
+window.dlCsv = function(type) {
+  const data = type === 'agg' ? aggData : detData;
+  if (!data || !data.length) return;
+  const cols = Object.keys(data[0]);
+  const esc = v => {
+    const s = v instanceof Date ? v.toISOString() : (v === null || v === undefined ? '' : String(v));
+    return (s.includes(',') || s.includes('"') || s.includes('\n')) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const csv = [cols.join(','), ...data.map(r => cols.map(c => esc(r[c])).join(','))].join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], {type: 'text/csv'}));
+  a.download = `ferc_eqr_${type}_${Date.now()}.csv`;
+  a.click();
+};
+
+// ── query builder ──────────────────────────────────────
+function buildQueries(metric, iso, grain, sy, sq, ey, eq) {
+  const qs = quarterList(sy, sq, ey, eq);
+  const pExpr = grain === 'quarter'
+    ? "strftime(date_trunc('quarter', obs_date), '%Y-%m-%d')"
+    : "strftime(date_trunc('year',    obs_date), '%Y-%m-%d')";
+  const isoF = iso === 'ALL' ? '' : `AND iso = '${iso}'`;
+
+  if (metric === 'wind_ppa' || metric === 'solar_ppa') {
+    const tech = metric === 'wind_ppa' ? 'wind' : 'solar';
+    const urls = sqlArr(qs.map(q => `${BASE}/core_ferceqr__contracts/${q}.parquet`));
+    const base = `
+WITH src AS (
+  SELECT
+    TRY_CAST(quantity AS DOUBLE) AS quantity,
+    units, rate_units, class_name, term_name, product_name,
+    ferc_tariff_reference, rate_description,
+    point_of_receipt_balancing_authority,
+    point_of_delivery_balancing_authority,
+    seller_company_name, customer_company_name,
+    COALESCE(begin_date, commencement_date_of_contract_term, contract_execution_date) AS obs_date,
+    CONCAT_WS(' | ', seller_company_name, customer_company_name, ferc_tariff_reference,
+      rate_description, product_name, point_of_receipt_balancing_authority,
+      point_of_delivery_balancing_authority) AS text_blob,
+    COALESCE(TRY_CAST(rate AS DOUBLE), TRY_CAST(rate_minimum AS DOUBLE),
+      TRY_CAST(rate_maximum AS DOUBLE)) AS price_raw,
+    COALESCE(point_of_delivery_balancing_authority,
+      point_of_receipt_balancing_authority) AS ba
+  FROM read_parquet(${urls}, union_by_name=true)
+), screened AS (
+  SELECT
+    ${pExpr} AS period,
+    CAST(obs_date AS VARCHAR) AS obs_date,
+    seller_company_name, customer_company_name,
+    quantity, units, price_raw AS metric_value, rate_units,
+    class_name, term_name, product_name, rate_description,
+    point_of_receipt_balancing_authority,
+    point_of_delivery_balancing_authority,
+    ${ISO_CASE} AS iso,
+    text_blob
+  FROM src
+  WHERE obs_date IS NOT NULL
+    AND price_raw IS NOT NULL AND price_raw > 0 AND price_raw < 250
+    AND lower(COALESCE(rate_units,'')) LIKE '%mwh%'
+    AND regexp_matches(lower(COALESCE(text_blob,'')), '${tech}')
+    AND NOT regexp_matches(lower(COALESCE(text_blob,'')),
+      'rec only|renewable energy credit only|test energy|hourly|real[- ]?time|day[- ]ahead|market[- ]?based|merchant|index|formula')
+    AND lower(COALESCE(term_name,'')) IN ('lt','long')
+)`;
+    return {
+      title: `${tech.charAt(0).toUpperCase() + tech.slice(1)} PPA price ($/MWh)`,
+      agg: base + `
+SELECT period, iso,
+  COUNT(*) AS observations,
+  AVG(metric_value) AS avg_value,
+  MEDIAN(metric_value) AS median_value,
+  MIN(metric_value) AS min_value,
+  MAX(metric_value) AS max_value,
+  SUM(COALESCE(quantity,0)) AS total_quantity
+FROM screened WHERE 1=1 ${isoF}
+GROUP BY 1,2 ORDER BY period, iso;`,
+      det: base + `
+SELECT period, obs_date, iso AS zone,
+  seller_company_name AS seller, customer_company_name AS buyer,
+  quantity, units, metric_value AS price, rate_units,
+  class_name, term_name, product_name,
+  point_of_receipt_balancing_authority AS por_ba,
+  point_of_delivery_balancing_authority AS pod_ba,
+  rate_description
+FROM screened WHERE 1=1 ${isoF}
+ORDER BY obs_date DESC, seller, buyer LIMIT 10000;`
+    };
+  }
+
+  // transactions-based metrics
+  const urls = sqlArr(qs.map(q => `${BASE}/core_ferceqr__transactions/${q}.parquet`));
+  let productFilter, extraCol = '';
+  const titles = {
+    capacity_prices: 'Capacity prices',
+    ancillary_service_payments: 'Ancillary service payments',
+    energy_payments: 'Energy payments'
+  };
+
+  if (metric === 'capacity_prices') {
+    productFilter = "AND upper(COALESCE(product_name,'')) = 'CAPACITY' AND standardized_price > 0 AND standardized_price < 500";
+  } else if (metric === 'ancillary_service_payments') {
+    productFilter = `AND upper(COALESCE(product_name,'')) IN (
+      'SPINNING RESERVE','SUPPLEMENTAL RESERVE','REGULATION & FREQUENCY RESPONSE',
+      'REACTIVE SUPPLY & VOLTAGE CONTROL','BLACK START SERVICE')`;
+    extraCol = ', product_name';
+  } else {
+    productFilter = "AND upper(COALESCE(product_name,'')) = 'ENERGY'";
+  }
+
+  const base = `
+WITH src AS (
+  SELECT
+    COALESCE(transaction_begin_date, trade_date) AS obs_date,
+    seller_company_name, customer_company_name,
+    TRY_CAST(standardized_price AS DOUBLE) AS standardized_price,
+    TRY_CAST(total_transaction_charge AS DOUBLE) AS total_transaction_charge,
+    TRY_CAST(standardized_quantity AS DOUBLE) AS standardized_quantity,
+    rate_units, point_of_delivery_balancing_authority AS ba,
+    product_name, ferc_tariff_reference, class_name, term_name
+  FROM read_parquet(${urls}, union_by_name=true)
+), screened AS (
+  SELECT
+    ${pExpr} AS period,
+    CAST(obs_date AS VARCHAR) AS obs_date,
+    seller_company_name, customer_company_name,
+    ${ISO_CASE} AS iso,
+    upper(COALESCE(product_name,'')) AS product_name,
+    standardized_price AS metric_value,
+    total_transaction_charge, standardized_quantity,
+    rate_units, ferc_tariff_reference, class_name, term_name
+  FROM src
+  WHERE obs_date IS NOT NULL AND standardized_price IS NOT NULL ${productFilter}
+)`;
+
+  return {
+    title: titles[metric],
+    agg: base + `
+SELECT period, iso,
+  COUNT(*) AS observations,
+  AVG(metric_value) AS avg_value,
+  MEDIAN(metric_value) AS median_value,
+  SUM(COALESCE(total_transaction_charge,0)) AS total_payments,
+  SUM(COALESCE(standardized_quantity,0)) AS total_quantity
+FROM screened WHERE 1=1 ${isoF}
+GROUP BY 1,2 ORDER BY period, iso;`,
+    det: base + `
+SELECT period, obs_date, iso AS zone,
+  seller_company_name AS seller, customer_company_name AS buyer,
+  standardized_quantity AS quantity, metric_value AS price, rate_units,
+  total_transaction_charge${extraCol}, class_name, term_name, ferc_tariff_reference
+FROM screened WHERE 1=1 ${isoF}
+ORDER BY obs_date DESC, seller, buyer LIMIT 10000;`
+  };
+}
+
+function chooseCol(metric, stat) {
+  if (stat === 'average') return ['avg_value', 'Average value'];
+  if (stat === 'median')  return ['median_value', 'Median value'];
+  if (stat === 'total_payments') {
+    if (metric === 'wind_ppa' || metric === 'solar_ppa')
+      return ['avg_value', 'Average value (total_payments N/A for PPA contracts)'];
+    return ['total_payments', 'Total payments ($)'];
+  }
+  return ['avg_value', 'Average value'];
+}
+
+// ── main query runner ──────────────────────────────────
+window.runQuery = async function() {
+  const btn = document.getElementById('run-btn');
+  btn.disabled = true;
+  try {
+    let sy = +document.getElementById('sy').value;
+    let sq = +document.getElementById('sq').value;
+    const ey = +document.getElementById('ey').value;
+    const eq = +document.getElementById('eq').value;
+    const iso    = document.getElementById('iso').value;
+    const metric = document.getElementById('metric').value;
+    const grain  = document.querySelector('input[name="grain"]:checked').value;
+    const stat   = document.getElementById('stat').value;
+
+    const qk = (y, q) => y * 10 + q;
+    if (qk(sy, sq) > qk(ey, eq)) { setStatus('Start must be before end.', 'err'); return; }
+
+    const notes = [];
+    if (qk(sy, sq) < qk(2013, 3)) {
+      notes.push('Warning: PUDL dataset starts at 2013Q3 — adjusting start to 2013Q3.');
+      sy = 2013; sq = 3;
+      if (qk(sy, sq) > qk(ey, eq)) { setStatus('Range only covers pre-2013Q3 data — not available.', 'err'); return; }
+    }
+
+    const qs = quarterList(sy, sq, ey, eq);
+    setStatus(`Querying ${qs.length} quarter(s)… may take 30–120 s depending on range and metric.`, 'loading');
+
+    const {title, agg, det} = buildQueries(metric, iso, grain, sy, sq, ey, eq);
+
+    const aggRes = await conn.query(agg);
+    aggData = arrowToRows(aggRes);
+    if (!aggData.length) { setStatus('No rows matched the filters.', 'err'); return; }
+
+    const detRes = await conn.query(det);
+    detData = arrowToRows(detRes);
+
+    // build chart
+    const [col, yLabel] = chooseCol(metric, stat);
+    const groups = {};
+    aggData.forEach(r => {
+      if (!groups[r.iso]) groups[r.iso] = {x: [], y: []};
+      groups[r.iso].x.push(r.period);
+      groups[r.iso].y.push(r[col]);
+    });
+    const traces = Object.entries(groups).map(([name, {x, y}]) => ({
+      type: 'scatter', mode: 'lines+markers', name, x, y
+    }));
+    Plotly.react('chart-box', traces, {
+      title: {text: `${title} — by ${grain}`},
+      xaxis: {title: 'Period', type: 'category'},
+      yaxis: {title: yLabel},
+      legend: {title: {text: 'Zone'}},
+      margin: {t: 50, r: 20, l: 70, b: 60}
+    }, {responsive: true});
+    document.getElementById('chart-title').textContent = `${title} — by ${grain}`;
+    document.getElementById('chart-card').style.display = '';
+
+    renderTable('agg-table', aggData);
+    document.getElementById('agg-card').style.display = '';
+
+    const capped = detData.length === 10000;
+    document.getElementById('det-note').textContent = capped
+      ? `(showing first 10,000 rows — download CSV for full dataset)`
+      : `(${detData.length.toLocaleString()} rows)`;
+    renderTable('det-table', detData);
+    document.getElementById('det-card').style.display = '';
+
+    notes.push(`Agg rows: ${aggData.length} | Detail rows: ${detData.length}${capped ? ' (capped at 10k)' : ''}`);
+    notes.push(`Metric: ${metric} | Grain: ${grain} | Stat: ${stat}`);
+    setStatus(notes.join('\n'));
+
+  } catch (e) {
+    setStatus('Query failed: ' + e.message, 'err');
+    console.error(e);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+// ── DuckDB-WASM init ───────────────────────────────────
+(async function init() {
+  try {
+    const BUNDLES = duckdb.getJsDelivrBundles();
+    const bundle  = await duckdb.selectBundle(BUNDLES);
+    const wUrl = URL.createObjectURL(
+      new Blob([`importScripts("${bundle.mainWorker}");`], {type: 'text/javascript'})
+    );
+    const worker = new Worker(wUrl);
+    const db = new duckdb.AsyncDuckDB(new duckdb.VoidLogger(), worker);
+    await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+    URL.revokeObjectURL(wUrl);
+    conn = await db.connect();
+    const btn = document.getElementById('run-btn');
+    btn.textContent = 'Run Query';
+    btn.disabled = false;
+    setStatus('Ready — select parameters and click Run Query.');
+  } catch (e) {
+    setStatus('Failed to load DuckDB-WASM: ' + e.message, 'err');
+    console.error(e);
+  }
+})();
+</script>
+</body>
+</html>
